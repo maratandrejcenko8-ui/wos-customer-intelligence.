@@ -7,3 +7,16 @@ services:
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /api/status
     autoDeploy: true
+    envVars:
+      - key: WB_API_TOKEN
+        sync: false
+      - key: OZON_CLIENT_ID
+        sync: false
+      - key: OZON_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ANTHROPIC_MODEL
+        value: claude-haiku-5-5
+      - key: APP_ACCESS_KEY
+        sync: false

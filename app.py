@@ -462,31 +462,26 @@ def classify(text, rating=None):
 
 
 def ai_analyze(rows, result):
-    api_key = os.getenv('OPENAI_API_KEY')
+    api_key = os.getenv('ANTHROPIC_API_KEY')
     if not api_key:
-        result['ai_error'] = 'OPENAI_API_KEY не настроен; показан локальный анализ по ключевым словам.'
+        result['ai_error'] = 'ANTHROPIC_API_KEY не настроен; показан локальный анализ по ключевым словам.'
         return
     try:
         sample = [{'product': r['product'], 'rating': r['rating'], 'text': r['text'][:600], 'source': r['source']} for r in rows[:120]]
-        prompt = {'task': 'Проанализируй отзывы покупателей fashion-бренда. Верни краткие русскоязычные выводы только по данным; не выдумывай факты. Проценты должны опираться на предоставленную выборку. Формат JSON: summary (строка), strengths (массив строк), risks (массив строк), actions (массив объектов priority,title,detail).',
+        prompt = {'task': 'Проанализируй отзывы покупателей fashion-бренда. Верни краткие русскоязычные выводы только по данным; не выдумывай факты. Проценты должны опираться на предоставленную выборку. Ответ: только JSON без пояснений, формат: summary (строка), strengths (массив строк), risks (массив строк), actions (массив объектов priority,title,detail).',
                   'sample_size': len(sample), 'total_reviews': len(rows), 'sample': sample,
                   'calculated_metrics': {'total': result['total'], 'themes': result['themes'], 'sentiment': result['sentiment']}}
-        body = json.dumps({'model': os.getenv('OPENAI_MODEL', 'gpt-4.1-mini'), 'input': json.dumps(prompt, ensure_ascii=False),
-                           'text': {'format': {'type': 'json_object'}}}).encode('utf-8')
-        req = urllib.request.Request('https://api.openai.com/v1/responses', data=body, method='POST',
-                                     headers={'Authorization': 'Bearer ' + api_key, 'Content-Type': 'application/json'})
+        body = json.dumps({'model': os.getenv('ANTHROPIC_MODEL', 'claude-haiku-5-5'), 'max_tokens': 2000,
+                           'messages': [{'role': 'user', 'content': json.dumps(prompt, ensure_ascii=False)}]}).encode('utf-8')
+        req = urllib.request.Request('https://api.anthropic.com/v1/messages', data=body, method='POST',
+                                     headers={'x-api-key': api_key, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json'})
         with urllib.request.urlopen(req, timeout=60) as response:
             ai = json.loads(response.read().decode('utf-8'))
-        parts = []
-        for item in ai.get('output', []):
-            if item.get('type') == 'message':
-                for c in item.get('content', []):
-                    if c.get('type') == 'output_text':
-                        parts.append(c.get('text', ''))
-        text_out = ''.join(parts)
-        if text_out:
-            result['ai'] = json.loads(text_out)
-            result['ai_mode'] = 'openai'
+        text_out = ''.join(c.get('text', '') for c in ai.get('content', []) if c.get('type') == 'text')
+        start, end = text_out.find('{'), text_out.rfind('}')
+        if start != -1 and end > start:
+            result['ai'] = json.loads(text_out[start:end + 1])
+            result['ai_mode'] = 'claude'
     except Exception:
         result['ai_error'] = 'AI не ответил; показан локальный анализ. Проверьте ключ, модель и подключение.'
 
@@ -664,7 +659,7 @@ def status():
                               'status': 'not_configured' if not configured else ('synced' if row['n'] else 'configured_unverified'),
                               'hint': None if configured else ('Задайте WB_API_TOKEN на сервере.' if mp == 'wildberries'
                                                                else 'Задайте OZON_CLIENT_ID и OZON_API_KEY на сервере.')}
-    return {'analysis': 'local rules + optional OpenAI', 'openai_configured': bool(os.getenv('OPENAI_API_KEY')),
+    return {'analysis': 'local rules + optional Claude', 'ai_configured': bool(os.getenv('ANTHROPIC_API_KEY')),
             'access_required': bool(access_key()), 'connectors': connectors}
 
 
