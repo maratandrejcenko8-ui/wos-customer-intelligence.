@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone, date
 from datetime import time as dtime
 from typing import Optional, List
-import csv, io, json, os, re, sqlite3, statistics, time, hmac
+import csv, io, json, os, re, sqlite3, statistics, time, hmac, threading, contextvars, uuid
 import urllib.request, urllib.parse, urllib.error
 
 BASE = Path(__file__).parent
@@ -165,11 +165,20 @@ WB_FEEDBACKS = 'https://feedbacks-api.wildberries.ru'
 OZON_API = 'https://api-seller.ozon.ru'
 
 
+CREDS = contextvars.ContextVar('wos_client_creds', default=None)
+
+
 def wb_token():
+    c = CREDS.get()
+    if c is not None:  # ключ клиента из формы на сайте; ключи сервера не используются
+        return c.get('wb', '')
     return os.getenv('WB_API_TOKEN', '').strip()
 
 
 def ozon_creds():
+    c = CREDS.get()
+    if c is not None:
+        return c.get('oz_id', ''), c.get('oz_key', '')
     return os.getenv('OZON_CLIENT_ID', '').strip(), os.getenv('OZON_API_KEY', '').strip()
 
 
@@ -660,7 +669,7 @@ def status():
                               'hint': None if configured else ('Задайте WB_API_TOKEN на сервере.' if mp == 'wildberries'
                                                                else 'Задайте OZON_CLIENT_ID и OZON_API_KEY на сервере.')}
     return {'analysis': 'local rules + optional Claude', 'ai_configured': bool(os.getenv('ANTHROPIC_API_KEY')),
-            'access_required': bool(access_key()), 'connectors': connectors}
+            'access_required': bool(access_key()), 'self_serve': True, 'connectors': connectors}
 
 
 @app.get('/api/sample')
@@ -833,6 +842,129 @@ async def import_file(file: UploadFile = File(...)):
     else:
         raise HTTPException(400, 'Поддерживаются CSV и JSON.')
     return report(rows, use_ai=True, brand='Импорт: ' + (file.filename or 'файл'))
+
+
+# ----------------------------------------------------------------------------
+# Самостоятельный отчёт: клиент вводит СВОЙ ключ API на сайте и получает отчёт.
+# Ключ хранится только в памяти фонового потока на время задачи, не пишется в БД и логи.
+# ----------------------------------------------------------------------------
+LIVE_JOBS = {}
+LIVE_HITS = {}
+LIVE_LOCK = threading.Lock()
+LIVE_MAX_RUNNING = 3
+LIVE_PER_HOUR = 6
+LIVE_TTL = 1800
+
+
+class LiveIn(BaseModel):
+    marketplace: str
+    wb_token: Optional[str] = None
+    ozon_client_id: Optional[str] = None
+    ozon_api_key: Optional[str] = None
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+    brand: Optional[str] = None
+
+
+def _clean_secret(v, label, min_len):
+    v = (v or '').strip()
+    if len(v) < min_len:
+        raise HTTPException(400, f'Вставьте {label}.')
+    if len(v) > 4000 or re.search(r'\s', v):
+        raise HTTPException(400, f'{label[0].upper()}{label[1:]} вставлен неверно: в нём не должно быть пробелов и переносов.')
+    return v
+
+
+def _live_set(jid, **kw):
+    with LIVE_LOCK:
+        if jid in LIVE_JOBS:
+            LIVE_JOBS[jid].update(kw)
+
+
+def _live_worker(jid, mp, creds, start, end, d_from, d_to, brand):
+    CREDS.set(creds)
+    try:
+        label = MARKETPLACES[mp]
+        _live_set(jid, progress=f'{label}: загружаем список товаров…')
+        items = PRODUCT_FETCHERS[mp](5000)
+        if not items:
+            raise ConnectorError('В кабинете не найдено товаров. Проверьте, что ключ от нужного кабинета.', 404)
+        fetcher, keyfield = REVIEW_FETCHERS[mp]
+        pmap = {str(p[keyfield]): p for p in items if p.get(keyfield)}
+        if not pmap:
+            raise ConnectorError('У товаров нет идентификаторов для поиска отзывов.', 502)
+        _live_set(jid, progress=f'Товаров: {len(items)}. Загружаем отзывы за период…')
+        revs = fetcher(set(pmap), start, end)
+        rows = [{'source': label, 'product': pmap[r['key']]['name'], 'rating': r['rating'],
+                 'date': r['created'].strftime('%Y-%m-%d'), 'text': r['text'], 'url': ''} for r in revs]
+        if not rows:
+            raise ConnectorError(f'За период {d_from} — {d_to} отзывов с текстом не найдено. Расширьте период.', 404)
+        _live_set(jid, progress=f'Отзывов: {len(rows)}. Анализируем…')
+        result = report(rows, use_ai=bool(os.getenv('ANTHROPIC_API_KEY')), brand=brand or f'Кабинет {label}')
+        result['notes'].append('Учитываются только отзывы с текстом; оценки без текста в отчёт не попадают.')
+        result.update({'period': {'from': d_from, 'to': d_to}, 'origin': 'live',
+                       'fetch': {mp: {'products': len(items), 'fetched': len(rows), 'new': len(rows)}}, 'fetch_errors': []})
+        _live_set(jid, status='done', result=result, progress='Готово')
+    except ConnectorError as e:
+        _live_set(jid, status='error', error=e.message)
+    except HTTPException as e:
+        _live_set(jid, status='error', error=str(e.detail))
+    except Exception:
+        _live_set(jid, status='error', error='Не удалось сформировать отчёт. Попробуйте ещё раз позже.')
+    finally:
+        CREDS.set(None)
+
+
+def live_start(body, ip='anon', run_async=True):
+    mp = (body.marketplace or '').strip()
+    if mp == 'wildberries':
+        creds = {'wb': _clean_secret(body.wb_token, 'токен Wildberries', 20)}
+    elif mp == 'ozon':
+        creds = {'oz_id': _clean_secret(body.ozon_client_id, 'Client-Id Ozon', 3),
+                 'oz_key': _clean_secret(body.ozon_api_key, 'Api-Key Ozon', 20)}
+    else:
+        raise HTTPException(400, 'Выберите Wildberries или Ozon.')
+    start, end, d_from, d_to = period_bounds(body.date_from, body.date_to)
+    brand = (body.brand or '').strip()[:80]
+    now = time.time()
+    with LIVE_LOCK:
+        for k in [k for k, j in LIVE_JOBS.items() if now - j['created'] > LIVE_TTL]:
+            del LIVE_JOBS[k]
+        hits = [t for t in LIVE_HITS.get(ip, []) if now - t < 3600]
+        if len(hits) >= LIVE_PER_HOUR:
+            raise HTTPException(429, 'Слишком много запусков. Попробуйте через час.')
+        if sum(1 for j in LIVE_JOBS.values() if j['status'] == 'running') >= LIVE_MAX_RUNNING:
+            raise HTTPException(429, 'Сервер сейчас занят другими отчётами. Повторите через пару минут.')
+        hits.append(now)
+        LIVE_HITS[ip] = hits
+        jid = uuid.uuid4().hex
+        LIVE_JOBS[jid] = {'status': 'running', 'progress': 'Запускаем…', 'created': now, 'result': None, 'error': None}
+    args = (jid, mp, creds, start, end, d_from, d_to, brand)
+    if run_async:
+        threading.Thread(target=_live_worker, args=args, daemon=True).start()
+    else:
+        _live_worker(*args)
+    return {'job': jid}
+
+
+def live_get(jid):
+    with LIVE_LOCK:
+        j = LIVE_JOBS.get(jid)
+        if not j:
+            raise HTTPException(404, 'Задача не найдена или устарела. Запустите отчёт заново.')
+        out = {'status': j['status'], 'progress': j['progress'], 'error': j['error'], 'result': j['result']}
+    return out
+
+
+@app.post('/api/live/start')
+def live_start_route(body: LiveIn, x_forwarded_for: str = Header(default='')):
+    ip = x_forwarded_for.split(',')[0].strip() if x_forwarded_for else 'anon'
+    return JSONResponse(live_start(body, ip or 'anon'), headers={'Cache-Control': 'no-store'})
+
+
+@app.get('/api/live/{job_id}')
+def live_get_route(job_id: str):
+    return JSONResponse(live_get(job_id), headers={'Cache-Control': 'no-store'})
 
 
 app.include_router(api)
